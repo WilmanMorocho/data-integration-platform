@@ -1,8 +1,10 @@
 import io
 import pandas as pd
 import xml.etree.ElementTree as ET
-from fastapi import APIRouter, UploadFile, File, Depends, HTTPException
+from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
+from pydantic import BaseModel, ValidationError
+from lxml import etree
 from backend.database import SessionLocal
 from backend.models.company_data import CompanyData
 
@@ -16,20 +18,50 @@ def get_db():
     finally:
         db.close()
 
+# Modelo Pydantic para validar JSON
+class DataModel(BaseModel):
+    field1: str
+    field2: int
+    field3: str
+
+# Función para validar contenido
+def validate_content(file_content: bytes, file_type: str):
+    if file_type == "json":
+        try:
+            import json
+            data = json.loads(file_content.decode("utf-8"))
+            if not data:
+                raise ValueError("JSON body is empty")
+            if isinstance(data, list):
+                for item in data:
+                    DataModel(**item)
+            else:
+                DataModel(**data)
+            return True
+        except (json.JSONDecodeError, ValidationError) as e:
+            raise ValueError(f"Invalid JSON: {e}")
+    elif file_type == "xml":
+        try:
+            if not file_content.strip():
+                raise ValueError("XML body is empty")
+            etree.fromstring(file_content)
+            return True
+        except etree.XMLSyntaxError as e:
+            raise ValueError(f"Invalid XML: {e}")
+    else:
+        raise ValueError("Unsupported file type")
+
 # Función para transformar los datos
 def transform_data(file_content: bytes, file_type: str):
     if file_type == "json":
-        # Leer y transformar JSON
         df = pd.read_json(io.BytesIO(file_content))
         df.drop_duplicates(inplace=True)
         df.fillna("N/A", inplace=True)
-        # Asegurar que las columnas requeridas existan
         for col in ["field1", "field2", "field3"]:
             if col not in df.columns:
                 df[col] = "N/A"
         return df
     elif file_type == "xml":
-        # Leer y transformar XML
         try:
             root = ET.fromstring(file_content.decode("utf-8"))
             data = []
@@ -38,7 +70,6 @@ def transform_data(file_content: bytes, file_type: str):
             df = pd.DataFrame(data)
             df.drop_duplicates(inplace=True)
             df.fillna("N/A", inplace=True)
-            # Asegurar que las columnas requeridas existan
             for col in ["field1", "field2", "field3"]:
                 if col not in df.columns:
                     df[col] = "N/A"
@@ -48,9 +79,8 @@ def transform_data(file_content: bytes, file_type: str):
     else:
         raise ValueError("Unsupported file type. Only JSON and XML are allowed.")
 
-# Función para cargar los datos en la base de datos
-def load_data_to_db(df, db: Session, company_name: str):
-    # Agregar la columna 'company_name' al DataFrame
+# Función para cargar los datos en la base de datos con status
+def load_data_to_db(df, db: Session, company_name: str, status: str = "processed"):
     df["company_name"] = company_name
     
     for _, row in df.iterrows():
@@ -58,29 +88,78 @@ def load_data_to_db(df, db: Session, company_name: str):
             company_name=row["company_name"],
             field1=row["field1"],
             field2=row["field2"],
-            field3=row["field3"]
+            field3=row["field3"],
+            status=status
         )
         db.add(record)
     db.commit()
 
-# Endpoint para procesar el archivo (ETL)
+# Función para procesar en background
+def process_in_background(company_name: str, file_content: bytes, file_type: str):
+    db = SessionLocal()  # Nueva sesión para background
+    try:
+        # Status inicial: uploaded
+        df_dummy = pd.DataFrame([{"field1": "N/A", "field2": 0, "field3": "N/A"}])
+        load_data_to_db(df_dummy, db, company_name, status="uploaded")
+        
+        # Validar
+        validate_content(file_content, file_type)
+        
+        # Status: processing
+        records = db.query(CompanyData).filter(CompanyData.company_name == company_name, CompanyData.status == "uploaded").all()
+        for record in records:
+            record.status = "processing"
+        db.commit()
+        
+        # Transform
+        df = transform_data(file_content, file_type)
+        
+        # Load con status "processed"
+        load_data_to_db(df, db, company_name, status="processed")
+        
+    except Exception as e:
+        # Status: error
+        records = db.query(CompanyData).filter(CompanyData.company_name == company_name).all()
+        for record in records:
+            record.status = "error"
+        db.commit()
+        print(f"Error in background processing: {e}")  # Log para debugging
+    finally:
+        db.close()
+
+# Endpoint para procesar el archivo (asíncrono con background)
 @router.post("/process")
 async def process_file(
     company_name: str,
     file: UploadFile = File(...),
-    db: Session = Depends(get_db)
+    background_tasks: BackgroundTasks = None,
 ):
-    # Extract
     file_content = await file.read()
     file_type = file.filename.split(".")[-1]
+    
+    # Iniciar procesamiento en background
+    background_tasks.add_task(process_in_background, company_name, file_content, file_type)
+    
+    return {"message": "Processing started in background"}
 
-    # Transform
-    try:
-        df = transform_data(file_content, file_type)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    # Load
-    load_data_to_db(df, db, company_name)
-
-    return {"message": "ETL process completed"}
+# Endpoint para consultar el status de los registros por company_name
+@router.get("/status/{company_name}")
+def get_status(company_name: str, db: Session = Depends(get_db)):
+    records = db.query(CompanyData).filter(CompanyData.company_name == company_name).all()
+    if not records:
+        raise HTTPException(status_code=404, detail="No records found for this company")
+    
+    return {
+        "company_name": company_name,
+        "records": [
+            {
+                "id": record.id,
+                "status": record.status,
+                "field1": record.field1,
+                "field2": record.field2,
+                "field3": record.field3,
+                "created_at": record.created_at
+            }
+            for record in records
+        ]
+    }
