@@ -1,12 +1,15 @@
 import io
 import pandas as pd
 import xml.etree.ElementTree as ET
+import logging
 from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, ValidationError
 from lxml import etree
 from backend.database import SessionLocal
 from backend.models.company_data import CompanyData
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -96,26 +99,32 @@ def load_data_to_db(df, db: Session, company_name: str, status: str = "processed
 
 # Función para procesar en background
 def process_in_background(company_name: str, file_content: bytes, file_type: str):
-    db = SessionLocal()  # Nueva sesión para background
+    logger.info(f"Starting background processing for company: {company_name}, file_type: {file_type}")
+    db = SessionLocal()
     try:
         # Status inicial: uploaded
         df_dummy = pd.DataFrame([{"field1": "N/A", "field2": 0, "field3": "N/A"}])
         load_data_to_db(df_dummy, db, company_name, status="uploaded")
+        logger.info(f"Initial records created with status 'uploaded' for {company_name}")
         
         # Validar
         validate_content(file_content, file_type)
+        logger.info(f"Validation successful for {company_name}")
         
         # Status: processing
         records = db.query(CompanyData).filter(CompanyData.company_name == company_name, CompanyData.status == "uploaded").all()
         for record in records:
             record.status = "processing"
         db.commit()
+        logger.info(f"Status updated to 'processing' for {company_name}")
         
         # Transform
         df = transform_data(file_content, file_type)
+        logger.info(f"Transformation successful for {company_name}")
         
         # Load con status "processed"
         load_data_to_db(df, db, company_name, status="processed")
+        logger.info(f"ETL completed successfully for {company_name}")
         
     except Exception as e:
         # Status: error
@@ -123,17 +132,18 @@ def process_in_background(company_name: str, file_content: bytes, file_type: str
         for record in records:
             record.status = "error"
         db.commit()
-        print(f"Error in background processing: {e}")  # Log para debugging
+        logger.error(f"Error in background processing for {company_name}: {e}")
     finally:
         db.close()
 
-# Endpoint para procesar el archivo (asíncrono con background)
+# Endpoint para procesar el archivo
 @router.post("/process")
 async def process_file(
     company_name: str,
     file: UploadFile = File(...),
     background_tasks: BackgroundTasks = None,
 ):
+    logger.info(f"Process endpoint called for company: {company_name}, file: {file.filename}")
     file_content = await file.read()
     file_type = file.filename.split(".")[-1]
     
@@ -142,11 +152,13 @@ async def process_file(
     
     return {"message": "Processing started in background"}
 
-# Endpoint para consultar el status de los registros por company_name
+# Endpoint para consultar el status
 @router.get("/status/{company_name}")
 def get_status(company_name: str, db: Session = Depends(get_db)):
+    logger.info(f"Status endpoint called for company: {company_name}")
     records = db.query(CompanyData).filter(CompanyData.company_name == company_name).all()
     if not records:
+        logger.warning(f"No records found for company: {company_name}")
         raise HTTPException(status_code=404, detail="No records found for this company")
     
     return {
